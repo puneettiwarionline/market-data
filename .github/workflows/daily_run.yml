@@ -1,5 +1,5 @@
 name: Daily FII Data Fetcher
-run-name: FII Fetcher - ${{ github.event.schedule && 'Scheduled' || 'Manual' }} - ${{ github.run_number }} - ${{ steps.date.outputs.date }}
+run-name: FII Fetcher - ${{ github.event.schedule && 'Scheduled' || 'Manual' }} - Run #${{ github.run_number }} - ${{ github.event.head_commit.timestamp }}
 
 on:
   schedule:
@@ -11,10 +11,6 @@ jobs:
   run-script:
     runs-on: ubuntu-latest
     steps:
-      - name: Get Date
-        id: date
-        run: echo "date=$(date +'%d-%m-%Y')" >> $GITHUB_OUTPUT
-
       - name: Checkout Code
         uses: actions/checkout@v5
 

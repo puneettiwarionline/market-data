@@ -1,14 +1,21 @@
 from datetime import datetime
 import io
+import os
 import pandas as pd
 import requests
 
-# अपनी Bot Details यहाँ डालें
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-TELEGRAM_CHAT_ID = "YOUR_CHAT_ID_HERE"
+# GitHub Secrets से API Token रीड करेगा
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+
+# अपनी Telegram Chat ID यहाँ डालें (या इसे भी os.getenv("TELEGRAM_CHAT_ID") कर सकते हैं)
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN:
+        print("Error: TELEGRAM_API_TOKEN is missing from environment variables.")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,

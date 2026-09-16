@@ -12,9 +12,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def send_telegram_message(message):
-    if not TELEGRAM_BOT_TOKEN:
-        print("Error: TELEGRAM_API_TOKEN is missing from environment variables.")
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "TELEGRAM_API_TOKEN or TELEGRAM_CHAT_ID is missing from environment variables."
+        )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -22,7 +23,13 @@ def send_telegram_message(message):
         "text": message,
         "parse_mode": "Markdown",
     }
-    requests.post(url, json=payload)
+    response = requests.post(url, json=payload, timeout=30)
+    if not response.ok:
+        raise RuntimeError(
+            f"Telegram API returned {response.status_code}: {response.text}"
+        )
+
+    print("Telegram notification sent successfully.")
 
 
 def get_fii_data():

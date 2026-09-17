@@ -1,53 +1,39 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import os
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import requests
 
-# ============================================================
-# CONFIG
-# ============================================================
-
+# GitHub Secrets से API Token रीड करेगा
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_API_TOKEN")
+
+# अपनी Telegram Chat ID यहाँ डालें (या इसे भी os.getenv("TELEGRAM_CHAT_ID") कर सकते हैं)
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-HISTORY_FILE = "fii_position_history.csv"
-
+IST = ZoneInfo("Asia/Kolkata")
 NSE_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
     "Referer": "https://www.nseindia.com/",
 }
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
-
 def send_telegram_message(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError(
-            "TELEGRAM_API_TOKEN or TELEGRAM_CHAT_ID is missing."
+            "TELEGRAM_API_TOKEN or TELEGRAM_CHAT_ID is missing from environment variables."
         )
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "Markdown",
     }
-
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=30
-    )
-
+    response = requests.post(url, json=payload, timeout=30)
     if not response.ok:
         raise RuntimeError(
             f"Telegram API returned {response.status_code}: {response.text}"
@@ -56,589 +42,227 @@ def send_telegram_message(message):
     print("Telegram notification sent successfully.")
 
 
-# ============================================================
-# GET FII DATA FROM NSE
-# ============================================================
+def create_nse_session():
+    session = requests.Session()
+    session.headers.update(NSE_HEADERS)
+    session.get("https://www.nseindia.com/", timeout=30)
+    return session
 
-def get_fii_data_from_nse():
-    today = datetime.now().strftime("%d%m%Y")
 
-    url = (
-        f"https://archives.nseindia.com/content/"
-        f"nsccl/fao_participant_oi_{today}.csv"
+def get_latest_participant_data(session, lookback_days=7):
+    today = datetime.now(IST).date()
+
+    for days_ago in range(lookback_days):
+        report_date = today - timedelta(days=days_ago)
+        date_code = report_date.strftime("%d%m%Y")
+        url = (
+            "https://archives.nseindia.com/content/nsccl/"
+            f"fao_participant_oi_{date_code}.csv"
+        )
+        response = session.get(url, timeout=30)
+
+        if response.status_code == 404:
+            continue
+
+        response.raise_for_status()
+        data = pd.read_csv(io.StringIO(response.text), skiprows=1)
+        data.columns = data.columns.str.strip()
+        data["Client Type"] = data["Client Type"].str.strip()
+        return report_date, data
+
+    raise RuntimeError("Participant OI report was not found in the last 7 days.")
+
+
+def get_cash_activity(session):
+    response = session.get(
+        "https://www.nseindia.com/api/fiidiiTradeReact", timeout=30
     )
+    response.raise_for_status()
+    rows = response.json()
+    return {row["category"]: row for row in rows}
+
+
+def get_market_indices(session):
+    response = session.get("https://www.nseindia.com/api/allIndices", timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    indices = {row["index"].strip(): row for row in payload["data"]}
+    return payload["timestamp"], indices
+
+
+def get_position_signal(call_net, put_net):
+    if call_net < 0 < put_net:
+        return "🔴 Bearish"
+    if put_net < 0 < call_net:
+        return "🟢 Bullish"
+    return "🟡 Mixed"
+
+
+def get_breadth_signal(ratio):
+    if ratio > 1.5:
+        return "🟢 Broad Strength"
+    if ratio < 0.7:
+        return "🔴 Broad Weakness"
+    return "🟡 Mixed Breadth"
+
+
+def get_vix_signal(value, percent_change):
+    if percent_change > 5 or value >= 20:
+        return "🔴 High Fear"
+    if value >= 17:
+        return "🟠 Elevated"
+    if value < 14:
+        return "🟢 Low Fear"
+    return "🟡 Normal"
+
+
+def format_crore(value):
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}₹{abs(value):,.2f} Cr"
+
+
+def add_score(score, value, bullish_condition, bearish_condition):
+    if bullish_condition(value):
+        return score + 1
+    if bearish_condition(value):
+        return score - 1
+    return score
+
+
+def get_market_data():
+    session = create_nse_session()
+    sections = []
+    data_dates = []
+    score = 0
 
     try:
-        response = requests.get(
-            url,
-            headers=NSE_HEADERS,
-            timeout=30
+        cash = get_cash_activity(session)
+        fii_cash = cash["FII/FPI"]
+        dii_cash = cash["DII"]
+        fii_cash_net = float(fii_cash["netValue"])
+        dii_cash_net = float(dii_cash["netValue"])
+        cash_date = fii_cash["date"]
+        cash_icon = "🟢" if fii_cash_net >= 0 else "🔴"
+        dii_icon = "🟢" if dii_cash_net >= 0 else "🔴"
+        score = add_score(score, fii_cash_net, lambda value: value > 0, lambda value: value < 0)
+        sections.append(
+            "💰 *CASH MARKET*\n"
+            f"FII/FPI Net: `{format_crore(fii_cash_net)}` {cash_icon}\n"
+            f"DII Net: `{format_crore(dii_cash_net)}` {dii_icon}"
         )
-
-        if response.status_code != 200:
-            print("NSE FII file not available.")
-            return None
-
-        df = pd.read_csv(
-            io.StringIO(response.text),
-            skiprows=1
-        )
-
-        df.columns = df.columns.str.strip()
-
-        if "Client Type" not in df.columns:
-            print("Unexpected NSE file format.")
-            return None
-
-        df["Client Type"] = (
-            df["Client Type"]
-            .astype(str)
-            .str.strip()
-        )
-
-        fii_rows = df[df["Client Type"] == "FII"]
-
-        if fii_rows.empty:
-            print("FII row not found.")
-            return None
-
-        fii = fii_rows.iloc[0]
-
-        long_cnt = float(fii["Future Index Long"])
-        short_cnt = float(fii["Future Index Short"])
-
-        total = long_cnt + short_cnt
-
-        long_pct = (
-            long_cnt / total * 100
-            if total > 0
-            else 0
-        )
-
-        short_pct = (
-            short_cnt / total * 100
-            if total > 0
-            else 0
-        )
-
-        long_short_ratio = (
-            long_cnt / short_cnt
-            if short_cnt > 0
-            else 0
-        )
-
-        net_contracts = long_cnt - short_cnt
-
-        return {
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "fii_long": int(long_cnt),
-            "fii_short": int(short_cnt),
-            "long_pct": long_pct,
-            "short_pct": short_pct,
-            "long_short_ratio": long_short_ratio,
-            "net_contracts": int(net_contracts),
-        }
-
-    except Exception as e:
-        print(f"Error fetching NSE FII data: {e}")
-        return None
-
-
-# ============================================================
-# GET NIFTY DATA
-# ============================================================
-
-def get_nifty_data():
-    """
-    Uses Yahoo Finance chart API for NIFTY 50 (^NSEI).
-
-    This is only used for price/history.
-    """
-
-    url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        "^NSEI?range=3mo&interval=1d"
-    )
+        data_dates.append(f"Cash: {cash_date}")
+    except Exception as error:
+        print(f"Cash market data unavailable: {error}")
+        sections.append("💰 *CASH MARKET*\n⚠️ Data unavailable")
 
     try:
-        response = requests.get(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            },
-            timeout=30
+        participant_date, participant_data = get_latest_participant_data(session)
+        fii = participant_data[participant_data["Client Type"] == "FII"].iloc[0]
+        pro = participant_data[participant_data["Client Type"] == "Pro"].iloc[0]
+
+        long_count = int(fii["Future Index Long"])
+        short_count = int(fii["Future Index Short"])
+        total_count = long_count + short_count
+        long_share = long_count / total_count * 100 if total_count else 0
+        long_short_ratio = long_count / short_count if short_count else 0
+        net_contracts = long_count - short_count
+        score = add_score(score, net_contracts, lambda value: value > 0, lambda value: value < 0)
+
+        sections.append(
+            "📈 *FII INDEX FUTURES*\n"
+            f"Long: `{long_count:,}` | Short: `{short_count:,}`\n"
+            f"Net: `{net_contracts:+,}` {'🟢' if net_contracts >= 0 else '🔴'}\n"
+            f"Long Share: `{long_share:.2f}%` | L/S: `{long_short_ratio:.2f}`"
         )
 
-        if response.status_code != 200:
-            print("Unable to fetch Nifty data.")
-            return None
-
-        data = response.json()
-
-        result = data["chart"]["result"][0]
-
-        timestamps = result["timestamp"]
-        closes = result["indicators"]["quote"][0]["close"]
-
-        rows = []
-
-        for timestamp, close in zip(timestamps, closes):
-
-            if close is None:
-                continue
-
-            date = datetime.fromtimestamp(timestamp).strftime(
-                "%Y-%m-%d"
+        option_lines = ["🎯 *INDEX OPTIONS POSITIONING*"]
+        fii_option_signal = None
+        for label, row in (("FII", fii), ("Pro", pro)):
+            call_net = int(row["Option Index Call Long"] - row["Option Index Call Short"])
+            put_net = int(row["Option Index Put Long"] - row["Option Index Put Short"])
+            option_signal = get_position_signal(call_net, put_net)
+            if label == "FII":
+                fii_option_signal = option_signal
+            option_lines.append(
+                f"{label}: Call `{call_net:+,}` | Put `{put_net:+,}`\n"
+                f"Positioning: {option_signal}"
             )
+        sections.append("\n".join(option_lines))
 
-            rows.append({
-                "date": date,
-                "nifty_close": float(close)
-            })
-
-        nifty_df = pd.DataFrame(rows)
-
-        if nifty_df.empty:
-            return None
-
-        nifty_df = nifty_df.drop_duplicates(
-            subset=["date"]
-        )
-
-        nifty_df = nifty_df.sort_values("date")
-
-        return nifty_df
-
-    except Exception as e:
-        print(f"Error fetching Nifty data: {e}")
-        return None
-
-
-# ============================================================
-# LOAD HISTORY
-# ============================================================
-
-def load_history():
-
-    if not os.path.exists(HISTORY_FILE):
-        return pd.DataFrame()
+        if fii_option_signal == "🟢 Bullish":
+            score += 1
+        elif fii_option_signal == "🔴 Bearish":
+            score -= 1
+        data_dates.append(f"F&O: {participant_date.strftime('%d-%b-%Y')}")
+    except Exception as error:
+        print(f"Participant data unavailable: {error}")
+        sections.append("📈 *FII FUTURES & OPTIONS*\n⚠️ Data unavailable")
 
     try:
-        df = pd.read_csv(HISTORY_FILE)
-
-        if df.empty:
-            return pd.DataFrame()
-
-        df["date"] = pd.to_datetime(
-            df["date"]
+        index_timestamp, indices = get_market_indices(session)
+        nifty_500 = indices["NIFTY 500"]
+        advances = int(nifty_500["advances"])
+        declines = int(nifty_500["declines"])
+        breadth_ratio = advances / declines if declines else float("inf")
+        breadth_signal = get_breadth_signal(breadth_ratio)
+        score = add_score(
+            score,
+            breadth_ratio,
+            lambda value: value > 1.5,
+            lambda value: value < 0.7,
         )
 
-        return df.sort_values("date")
-
-    except Exception as e:
-        print(f"Error loading history: {e}")
-        return pd.DataFrame()
-
-
-# ============================================================
-# SAVE HISTORY
-# ============================================================
-
-def save_history(df):
-
-    df = df.copy()
-
-    df["date"] = pd.to_datetime(df["date"])
-
-    df = df.sort_values("date")
-
-    # One record per date
-    df = df.drop_duplicates(
-        subset=["date"],
-        keep="last"
-    )
-
-    df.to_csv(
-        HISTORY_FILE,
-        index=False
-    )
-
-    print(f"History saved: {HISTORY_FILE}")
-
-
-# ============================================================
-# CALCULATE CHANGES
-# ============================================================
-
-def calculate_changes(df):
-
-    if df.empty:
-        return None
-
-    df = df.sort_values("date").reset_index(drop=True)
-
-    latest = df.iloc[-1]
-
-    result = {
-        "current": latest
-    }
-
-    # --------------------------------------------------------
-    # 1 Trading Day
-    # --------------------------------------------------------
-
-    if len(df) >= 2:
-
-        previous = df.iloc[-2]
-
-        result["1d"] = {
-            "net": latest["net_contracts"] - previous["net_contracts"],
-            "long": latest["fii_long"] - previous["fii_long"],
-            "short": latest["fii_short"] - previous["fii_short"],
-            "long_pct": latest["long_pct"] - previous["long_pct"],
-        }
-
-    # --------------------------------------------------------
-    # 5 Trading Days
-    # --------------------------------------------------------
-
-    if len(df) >= 6:
-
-        previous = df.iloc[-6]
-
-        result["5d"] = {
-            "net": latest["net_contracts"] - previous["net_contracts"],
-            "long": latest["fii_long"] - previous["fii_long"],
-            "short": latest["fii_short"] - previous["fii_short"],
-            "long_pct": latest["long_pct"] - previous["long_pct"],
-        }
-
-    # --------------------------------------------------------
-    # 20 Trading Days
-    # --------------------------------------------------------
-
-    if len(df) >= 21:
-
-        previous = df.iloc[-21]
-
-        result["20d"] = {
-            "net": latest["net_contracts"] - previous["net_contracts"],
-            "long": latest["fii_long"] - previous["fii_long"],
-            "short": latest["fii_short"] - previous["fii_short"],
-            "long_pct": latest["long_pct"] - previous["long_pct"],
-        }
-
-    return result
-
-
-# ============================================================
-# NIFTY PERFORMANCE
-# ============================================================
-
-def calculate_nifty_changes(nifty_df):
-
-    if nifty_df is None or nifty_df.empty:
-        return None
-
-    nifty_df = nifty_df.sort_values("date").reset_index(drop=True)
-
-    latest = nifty_df.iloc[-1]
-
-    result = {
-        "price": latest["nifty_close"]
-    }
-
-    # 1 trading day
-    if len(nifty_df) >= 2:
-
-        previous = nifty_df.iloc[-2]
-
-        result["1d"] = (
-            latest["nifty_close"] /
-            previous["nifty_close"] - 1
-        ) * 100
-
-    # 5 trading days
-    if len(nifty_df) >= 6:
-
-        previous = nifty_df.iloc[-6]
-
-        result["5d"] = (
-            latest["nifty_close"] /
-            previous["nifty_close"] - 1
-        ) * 100
-
-    # 20 trading days
-    if len(nifty_df) >= 21:
-
-        previous = nifty_df.iloc[-21]
-
-        result["20d"] = (
-            latest["nifty_close"] /
-            previous["nifty_close"] - 1
-        ) * 100
-
-    return result
-
-
-# ============================================================
-# FORMAT NUMBER
-# ============================================================
-
-def fmt_number(value):
-
-    if pd.isna(value):
-        return "N/A"
-
-    return f"{int(value):,}"
-
-
-def fmt_change(value):
-
-    if value is None:
-        return "N/A"
-
-    if value > 0:
-        return f"+{value:,.0f}"
-
-    return f"{value:,.0f}"
-
-
-def fmt_pct(value):
-
-    if value is None:
-        return "N/A"
-
-    if value > 0:
-        return f"+{value:.2f}%"
-
-    return f"{value:.2f}%"
-
-
-# ============================================================
-# POSITIONING INTERPRETATION
-# ============================================================
-
-def get_positioning_signal(changes):
-
-    if not changes:
-        return "⚪ Insufficient history"
-
-    current = changes["current"]
-
-    net = current["net_contracts"]
-
-    # Current net positioning
-    if net > 0:
-        base = "🟢 Net Long"
-    elif net < 0:
-        base = "🔴 Net Short"
+        vix = indices["INDIA VIX"]
+        vix_value = float(vix["last"])
+        vix_change = float(vix["percentChange"])
+        vix_signal = get_vix_signal(vix_value, vix_change)
+        if vix_change > 5 or vix_value >= 20:
+            score -= 1
+
+        sections.append(
+            "🌐 *MARKET BREADTH — NIFTY 500*\n"
+            f"Advances: `{advances}` | Declines: `{declines}`\n"
+            f"A/D Ratio: `{breadth_ratio:.2f}` {breadth_signal}"
+        )
+        sections.append(
+            "⚡ *INDIA VIX*\n"
+            f"Value: `{vix_value:.2f}` | Change: `{vix_change:+.2f}%`\n"
+            f"Signal: {vix_signal}"
+        )
+        data_dates.append(f"Indices: {index_timestamp}")
+    except Exception as error:
+        print(f"Index data unavailable: {error}")
+        sections.append("🌐 *BREADTH & INDIA VIX*\n⚠️ Data unavailable")
+
+    if score >= 2:
+        overall_signal = "🟢 BULLISH"
+    elif score <= -2:
+        overall_signal = "🔴 BEARISH"
     else:
-        base = "⚪ Neutral"
+        overall_signal = "🟡 MIXED"
 
-    # Look at 5-day change if available
-    if "5d" in changes:
-
-        net_change = changes["5d"]["net"]
-
-        if net_change > 0:
-            trend = "FII positioning improving"
-        elif net_change < 0:
-            trend = "FII positioning weakening"
-        else:
-            trend = "FII positioning stable"
-
-        return f"{base}\n{trend}"
-
-    return base
-
-
-# ============================================================
-# CREATE TELEGRAM MESSAGE
-# ============================================================
-
-def create_message(fii_df, nifty_df):
-
-    changes = calculate_changes(fii_df)
-
-    if not changes:
-        return None
-
-    current = changes["current"]
-
-    nifty = calculate_nifty_changes(nifty_df)
-
-    date_display = pd.to_datetime(
-        current["date"]
-    ).strftime("%d-%b-%Y")
-
-    # --------------------------------------------------------
-    # FII
-    # --------------------------------------------------------
-
+    report_date = datetime.now(IST).strftime("%d %b %Y")
     message = (
-        f"📊 *FII POSITIONING DASHBOARD*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🗓 *Date:* {date_display}\n\n"
-
-        f"🔥 *INDEX FUTURES*\n"
-        f"Long: `{fmt_number(current['fii_long'])}`\n"
-        f"Short: `{fmt_number(current['fii_short'])}`\n"
-        f"Long %: `{current['long_pct']:.2f}%`\n"
-        f"Short %: `{current['short_pct']:.2f}%`\n"
-        f"L/S Ratio: `{current['long_short_ratio']:.2f}`\n"
-        f"Net Contracts: `{fmt_number(current['net_contracts'])}`\n\n"
+        f"📊 *MARKET SETUP | {report_date}*\n"
+        "━━━━━━━━━━━━━━━━━━━\n\n"
+        + "\n\n".join(sections)
+        + "\n\n━━━━━━━━━━━━━━━━━━━\n"
+        f"*OVERALL: {overall_signal}*\n"
+        "Signals are indicative, not trading advice."
     )
+    if data_dates:
+        message += "\n\n_Data: " + " | ".join(data_dates) + "_"
 
-    # --------------------------------------------------------
-    # Changes
-    # --------------------------------------------------------
-
-    message += "📈 *POSITION CHANGES*\n"
-
-    if "1d" in changes:
-        message += (
-            f"*1D Net:* `{fmt_change(changes['1d']['net'])}`\n"
-            f"*1D Long %:* `{fmt_pct(changes['1d']['long_pct'])}`\n"
-        )
-    else:
-        message += "*1D:* `Not enough history`\n"
-
-    if "5d" in changes:
-        message += (
-            f"*5D Net:* `{fmt_change(changes['5d']['net'])}`\n"
-            f"*5D Long %:* `{fmt_pct(changes['5d']['long_pct'])}`\n"
-        )
-    else:
-        message += "*5D:* `Not enough history`\n"
-
-    if "20d" in changes:
-        message += (
-            f"*20D Net:* `{fmt_change(changes['20d']['net'])}`\n"
-            f"*20D Long %:* `{fmt_pct(changes['20d']['long_pct'])}`\n"
-        )
-    else:
-        message += "*20D:* `Not enough history`\n"
-
-    # --------------------------------------------------------
-    # NIFTY
-    # --------------------------------------------------------
-
-    if nifty:
-
-        message += (
-            f"\n📉 *NIFTY 50*\n"
-            f"Price: `{nifty['price']:,.2f}`\n"
-        )
-
-        if "1d" in nifty:
-            message += f"1D: `{fmt_pct(nifty['1d'])}`\n"
-
-        if "5d" in nifty:
-            message += f"5D: `{fmt_pct(nifty['5d'])}`\n"
-
-        if "20d" in nifty:
-            message += f"20D: `{fmt_pct(nifty['20d'])}`\n"
-
-    # --------------------------------------------------------
-    # SIGNAL
-    # --------------------------------------------------------
-
-    signal = get_positioning_signal(changes)
-
-    message += (
-        f"\n🧭 *POSITIONING STATUS*\n"
-        f"{signal}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ *For analysis only — not a trading signal.*"
-    )
-
-    return message
+    send_telegram_message(message)
 
 
-# ============================================================
-# MAIN
-# ============================================================
-
-def get_fii_data():
-
-    print("Fetching FII data...")
-
-    fii_today = get_fii_data_from_nse()
-
-    if fii_today is None:
-
-        send_telegram_message(
-            f"⚠️ *FII Data Alert*\n\n"
-            f"NSE FII participant-OI data is not available "
-            f"for {datetime.now().strftime('%d-%b-%Y')}."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # Load old FII history
-    # --------------------------------------------------------
-
-    history = load_history()
-
-    today_df = pd.DataFrame([fii_today])
-
-    if not history.empty:
-
-        combined = pd.concat(
-            [history, today_df],
-            ignore_index=True
-        )
-
-    else:
-
-        combined = today_df
-
-    # --------------------------------------------------------
-    # Nifty
-    # --------------------------------------------------------
-
-    nifty_df = get_nifty_data()
-
-    if nifty_df is not None:
-
-        combined["date"] = pd.to_datetime(
-            combined["date"]
-        )
-
-        nifty_df["date"] = pd.to_datetime(
-            nifty_df["date"]
-        )
-
-        combined = combined.merge(
-            nifty_df,
-            on="date",
-            how="left"
-        )
-
-    # --------------------------------------------------------
-    # Save history
-    # --------------------------------------------------------
-
-    save_history(combined)
-
-    # --------------------------------------------------------
-    # Create Telegram message
-    # --------------------------------------------------------
-
-    message = create_message(
-        combined,
-        nifty_df
-    )
-
-    if message:
-        send_telegram_message(message)
+def main():
+    try:
+        get_market_data()
+    except Exception as error:
+        send_telegram_message(f"❌ *Market data error:* {str(error)}")
 
 
-# ============================================================
-# RUN
-# ============================================================
 
 if __name__ == "__main__":
-    get_fii_data()
+    main()
